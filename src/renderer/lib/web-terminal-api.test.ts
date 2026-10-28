@@ -119,8 +119,15 @@ class FakeWebSocket {
           id: req.id,
           success: false,
           error: 'Write failed',
-          code: 'WRITE_FAILED'
+          code: writeRejectCode
         })
+        return
+      }
+      if (writeReplyMode === 'in_progress') {
+        // The `{receipt: "in_progress"}` payload the host answers a resend
+        // whose first run is still going with (mapped to COMMAND_IN_PROGRESS
+        // by `request()`).
+        this.emitReply({ id: req.id, success: true, data: { receipt: 'in_progress' } })
         return
       }
     }
@@ -204,9 +211,14 @@ let attachReply: 'ok' | 'unauthorized' = 'ok'
 let holdAttachReply = false
 
 /** Test knob: how the fake answers `write` frames — 'ok' answers success,
- * 'reject' answers a definite host rejection (WRITE_FAILED). `holdWrite`
+ * 'reject' answers a definite host rejection (the code knob below), 'in_progress'
+ * answers the in-progress receipt (the first run is still going). `holdWrite`
  * records the frame but never replies (lost reply). */
-let writeReplyMode: 'ok' | 'reject' = 'ok'
+let writeReplyMode: 'ok' | 'reject' | 'in_progress' = 'ok'
+/** The code a 'reject' write reply carries. WRITE_FAILED by default (the
+ * flush drops the rejected chunk); set to another deterministic code to
+ * exercise the retain-and-retry path. */
+let writeRejectCode = 'WRITE_FAILED'
 
 /** Test knob: the spawn reply data (CAP-3 issuance carries the claim). */
 let spawnReplyData: Record<string, unknown> = mockSpawnedTerminal({
@@ -1906,6 +1918,7 @@ describe('WebTerminalClient offline input buffering (Story 10, F9/F10)', () => {
     FakeWebSocket.autoOpen = true
     FakeWebSocket.holdWrite = false
     writeReplyMode = 'ok'
+    writeRejectCode = 'WRITE_FAILED'
     vi.useRealTimers()
   })
 
@@ -1917,7 +1930,7 @@ describe('WebTerminalClient offline input buffering (Story 10, F9/F10)', () => {
     return { client, internals: client as unknown as ClientInternals }
   }
 
-  it('a definite host rejection on the flush retains the input and the delayed retry resends it under the SAME commandId', async () => {
+  it('a WRITE_FAILED on the flush drops the rejected chunk and never resends it under any id', async () => {
     vi.useFakeTimers()
     const { client, internals } = makeClient()
     await client.connect()
@@ -1926,28 +1939,72 @@ describe('WebTerminalClient offline input buffering (Story 10, F9/F10)', () => {
     await client.write('t1', 'abc')
 
     // Reconnect + re-attach succeed, but the flush write is refused with a
-    // definite host rejection (WRITE_FAILED) — not a lost reply.
+    // definite host rejection (WRITE_FAILED): the ledger recorded it, so a
+    // resend under the same id replays the recorded rejection forever, and a
+    // resend under a new id could double-type a partially applied chunk.
     writeReplyMode = 'reject'
     await vi.advanceTimersByTimeAsync(600)
     await vi.advanceTimersByTimeAsync(0)
-    const sock = internals.socket
-    const firstFrame = findSentRequest(sock, 'write') as {
-      commandId?: string
-      payload: { data?: string }
-    }
-    expect(firstFrame.payload.data).toBe('abc')
-    // Retained: the failed chunk goes back to the unconfirmed set + buffer —
-    // the terminal is still live and claim-held, so nothing is dropped.
-    expect(internals.inputBuffers.get('t1')).toBe('abc')
+    const writes = internals.socket.sent.filter(
+      (raw) => (JSON.parse(raw) as { type: string }).type === 'write'
+    )
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0]).payload.data).toBe('abc')
 
-    // The delayed retry fires 1s later on the SAME attached socket and resends
-    // the chunk under the SAME commandId (never typed twice).
+    // The rejected chunk is dropped — nothing retained under any id.
+    expect(internals.inputBuffers.has('t1')).toBe(false)
+    expect(internals.unconfirmedChunks.has('t1')).toBe(false)
+
+    // No retry churn: nothing left to flush, no more write frames.
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(
+      internals.socket.sent.filter((raw) => (JSON.parse(raw) as { type: string }).type === 'write')
+    ).toHaveLength(1)
+
+    client.dispose()
+  })
+
+  it('a WRITE_FAILED keeps queued and later keystrokes for the next flush (only the rejected chunk is dropped)', async () => {
+    vi.useFakeTimers()
+    const { client, internals } = makeClient()
+    await client.connect()
+    await client.attach('t1', 'claim-t1')
+    internals.socket.close()
+    await client.write('t1', 'abc')
+
+    // First flush: the host answers the in-progress receipt — 'abc' is
+    // retained under its id for the next flush (COMMAND_IN_PROGRESS is an
+    // accepted write, not a rejection). A keystroke typed after the failure
+    // queues behind it in the buffer.
+    writeReplyMode = 'in_progress'
+    await vi.advanceTimersByTimeAsync(600)
+    await vi.advanceTimersByTimeAsync(0)
+    await client.write('t1', 'de')
+    expect(internals.inputBuffers.get('t1')).toBe('abcde')
+
+    // The 1s retry replays 'abc' (same id) with 'de' queued behind it — and
+    // now the host answers WRITE_FAILED: the rejected leading chunk is
+    // dropped while the trailing chunk is preserved for the next flush.
+    writeReplyMode = 'reject'
     await vi.advanceTimersByTimeAsync(1_000)
     await vi.advanceTimersByTimeAsync(0)
-    const writes = sock.sent.filter((raw) => (JSON.parse(raw) as { type: string }).type === 'write')
-    expect(writes.length).toBe(2)
-    expect(JSON.parse(writes[1]).commandId).toBe(firstFrame.commandId)
-    expect(JSON.parse(writes[1]).payload.data).toBe('abc')
+    expect(internals.inputBuffers.get('t1')).toBe('de')
+    expect(internals.unconfirmedChunks.has('t1')).toBe(false)
+
+    // The next flush delivers ONLY the surviving input under a NEW id —
+    // the rejected chunk never comes back.
+    writeReplyMode = 'ok'
+    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(0)
+    const writes = internals.socket.sent.filter(
+      (raw) => (JSON.parse(raw) as { type: string }).type === 'write'
+    )
+    expect(writes).toHaveLength(3)
+    expect(JSON.parse(writes[2]).payload.data).toBe('de')
+    expect(JSON.parse(writes[2]).commandId).not.toBe(JSON.parse(writes[1]).commandId)
+    expect(internals.inputBuffers.has('t1')).toBe(false)
+    expect(internals.unconfirmedChunks.has('t1')).toBe(false)
 
     client.dispose()
   })
@@ -1961,6 +2018,9 @@ describe('WebTerminalClient offline input buffering (Story 10, F9/F10)', () => {
     await client.write('t1', 'abc')
 
     writeReplyMode = 'reject'
+    // WRITE_FAILED now drops the chunk outright — exercise the cap with a
+    // code that still takes the retain-and-retry path.
+    writeRejectCode = 'OUTCOME_UNKNOWN'
     await vi.advanceTimersByTimeAsync(600)
     await vi.advanceTimersByTimeAsync(0)
     // The initial flush + 3 retries = 4 recorded failures (under the cap);
@@ -1994,6 +2054,83 @@ describe('WebTerminalClient offline input buffering (Story 10, F9/F10)', () => {
       internals.socket.sent.filter((raw) => (JSON.parse(raw) as { type: string }).type === 'write')
         .length
     ).toBe(5)
+
+    client.dispose()
+  })
+
+  it('retains the buffered input when COMMAND_IN_PROGRESS replies exhaust the retry cap (retries stay bounded)', async () => {
+    vi.useFakeTimers()
+    const { client, internals } = makeClient()
+    await client.connect()
+    await client.attach('t1', 'claim-t1')
+    internals.socket.close()
+    await client.write('t1', 'abc')
+
+    // Reconnect + re-attach succeed, but every flush write answers the
+    // in-progress receipt: the first run of that commandId is still going on
+    // the host (an accepted write — never a rejection).
+    writeReplyMode = 'in_progress'
+    await vi.advanceTimersByTimeAsync(600)
+    await vi.advanceTimersByTimeAsync(0)
+    const firstFrame = findSentRequest(internals.socket, 'write') as {
+      commandId?: string
+      payload: { data?: string }
+    }
+    expect(firstFrame.payload.data).toBe('abc')
+    // The initial flush + 3 retries = 4 recorded failures (under the cap);
+    // each retry schedules another. The 5th in-progress failure retains.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    expect(internals.inputBuffers.get('t1')).toBe('abc')
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(0)
+    // Retained, not deleted: the payload was accepted for delivery and must
+    // be resent under the SAME commandId (the host answers ok without typing
+    // it twice).
+    expect(internals.inputBuffers.get('t1')).toBe('abc')
+    expect(internals.unconfirmedChunks.get('t1')?.data).toBe('abc')
+    expect(internals.unconfirmedChunks.get('t1')?.commandId).toBe(firstFrame.commandId)
+    // Retention is a warn, not the error-level drop.
+    expect(mockLogFrontendError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        level: 'warn',
+        source: 'WebTerminalClient.flushInputBuffer',
+        message: expect.stringContaining('input retained')
+      })
+    )
+    // Retries stay bounded: the cap stops the 1s loop — no more write frames.
+    const writes = internals.socket.sent.filter(
+      (raw) => (JSON.parse(raw) as { type: string }).type === 'write'
+    )
+    expect(writes.length).toBe(5)
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(
+      internals.socket.sent.filter((raw) => (JSON.parse(raw) as { type: string }).type === 'write')
+        .length
+    ).toBe(5)
+
+    // A later re-attach flush (which also resets the failure count) resends
+    // the retained chunk under the SAME commandId and clears the buffers.
+    writeReplyMode = 'ok'
+    internals.socket.close()
+    // This is the SECOND reconnect of the cycle, so the backoff delay has
+    // climbed past the base — advance in ticks until the flush appears.
+    for (let i = 0; i < 5 && internals.socket === null; i++) {
+      await vi.advanceTimersByTimeAsync(1_000)
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    const flushed = internals.socket.sent.filter(
+      (raw) => (JSON.parse(raw) as { type: string }).type === 'write'
+    )
+    expect(flushed.length).toBe(1)
+    expect(JSON.parse(flushed[0]).commandId).toBe(firstFrame.commandId)
+    expect(JSON.parse(flushed[0]).payload.data).toBe('abc')
+    expect(internals.inputBuffers.has('t1')).toBe(false)
+    expect(internals.unconfirmedChunks.has('t1')).toBe(false)
 
     client.dispose()
   })

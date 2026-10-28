@@ -16,7 +16,7 @@ import type {
   TerminalSpawnOptions,
   TerminalStateSnapshot
 } from '@shared/types/ipc.types'
-import { COMMAND_RESULT_CODES, IN_PROGRESS_RECEIPT } from '@shared/types/ipc.types'
+import { COMMAND_RESULT_CODES, IN_PROGRESS_RECEIPT, IpcErrorCodes } from '@shared/types/ipc.types'
 import {
   WEB_TERMINAL_ERROR_CODES,
   type WebTerminalEventPayload,
@@ -53,10 +53,13 @@ const REQUEST_TIMEOUT_MS = 15_000
 const INPUT_BUFFER_MAX_CHARS = 8_192
 /** Wait before replaying buffered input whose first replay was not confirmed. */
 const IN_PROGRESS_FLUSH_RETRY_MS = 1_000
-/** Consecutive failed buffered-input flushes tolerated before the buffers are
- * dropped (deterministic-rejection escape hatch — see the failure branch).
- * A successful re-attach resets the count, so a channel outage whose flushes
- * fail only while the socket is down can never exhaust the cap on its own. */
+/** Consecutive failed buffered-input flushes tolerated before the 1s retry
+ * loop stops (the retry bound for EVERY failure code — see the failure
+ * branch). At the cap a DETERMINISTIC host rejection drops the buffers (the
+ * user can retype); a COMMAND_IN_PROGRESS reply retains them for the next
+ * re-attach flush. A successful re-attach resets the count, so a channel
+ * outage whose flushes fail only while the socket is down can never exhaust
+ * the cap on its own. */
 const REPLAY_MAX_FAILURES = 5
 const RECONNECT_MAX_ATTEMPTS = 10
 /** How long the page must stay hidden before a return triggers a proactive
@@ -185,10 +188,10 @@ export class WebTerminalClient {
   private readonly unconfirmedChunks = new Map<string, { commandId: string; data: string }>()
   /**
    * Consecutive failed buffered-input flush counts per terminal (any failure
-   * code). Deleted when the cap is hit or the terminal's buffers are dropped
-   * for good; reset by any successful flush write and by attach success — so
+   * code). Reset by any successful flush write and by attach success — so
    * only a persistently failing write while the socket stays attached can
-   * exhaust the cap.
+   * exhaust the cap. At the cap the retry loop stops: a deterministic host
+   * rejection drops the buffers; a COMMAND_IN_PROGRESS reply retains them.
    */
   private readonly replayFailureCounts = new Map<string, number>()
   /**
@@ -852,6 +855,7 @@ export class WebTerminalClient {
     // Story 10: a killed terminal's buffered input is dropped with it.
     this.inputBuffers.delete(terminalId)
     this.unconfirmedChunks.delete(terminalId)
+    this.replayFailureCounts.delete(terminalId)
   }
   /**
    * Story 10 (F9/F10): write terminal input. When the socket is down (or this
@@ -1005,17 +1009,20 @@ export class WebTerminalClient {
           this.replayFailureCounts.delete(terminalId)
           continue
         }
-        // ANY replay failure (NETWORK_ERROR, IN_PROGRESS receipt, or a host
-        // rejection) retains the payload: the failed chunk goes back to the
-        // unconfirmed set under its own id — at-least-once becomes
+        // A replay failure (NETWORK_ERROR, IN_PROGRESS receipt, or a host
+        // rejection) normally retains the payload: the failed chunk goes back
+        // to the unconfirmed set under its own id — at-least-once becomes
         // exactly-once, so a first run that did reach the PTY is not typed
         // twice — ahead of any arrivals buffered behind the hold. The next
         // flush (the delayed retry below while the socket stays attached, or
-        // the next re-attach) replays both in order. A dead tracker (exited /
-        // claim severed) drops the buffers instead: input for a dead terminal
-        // is moot. Story 10: durable failure log — error code only; the
-        // replayed input is terminal keystrokes and is never logged.
-        // Disposed: the maps were already cleared — never repopulate them.
+        // the next re-attach) replays both in order. WRITE_FAILED is the one
+        // exception (branched below): the host's command ledger recorded the
+        // rejection, so resending can neither succeed nor re-run. A dead
+        // tracker (exited / claim severed) drops the buffers instead: input
+        // for a dead terminal is moot. Story 10: durable failure log — error
+        // code only; the replayed input is terminal keystrokes and is never
+        // logged. Disposed: the maps were already cleared — never repopulate
+        // them.
         if (this.disposed) return
         const tracker = this.trackers.get(terminalId)
         if (!tracker || tracker.exited || tracker.disconnected || !tracker.claim) {
@@ -1028,12 +1035,26 @@ export class WebTerminalClient {
         // (WRITE_FAILED on a broken PTY, say) would retry every
         // IN_PROGRESS_FLUSH_RETRY_MS forever — one warn log per second and a
         // full INPUT_BLOCKED buffer holding the terminal's input hostage.
-        // After the cap the buffers are dropped and the terminal unblocks
-        // (the user can retype). A successful re-attach or a successful
-        // flush write resets the count, so outage-cycle failures — only
-        // possible while the socket is down — never accumulate toward it.
+        // After the cap a deterministic rejection drops the buffers and the
+        // terminal unblocks (the user can retype). A successful re-attach or
+        // a successful flush write resets the count, so outage-cycle failures
+        // — only possible while the socket is down — never accumulate toward
+        // it.
         const failures = (this.replayFailureCounts.get(terminalId) ?? 0) + 1
-        if (failures >= REPLAY_MAX_FAILURES) {
+        // A COMMAND_IN_PROGRESS reply is NOT a rejection: the first run of
+        // this chunk's commandId is still going on the host (the host's PTY
+        // write has no timeout, so one run can outlast several 1s retries).
+        // Its payload was already accepted for delivery — `write()` reported
+        // success — so at the cap it is RETAINED (re-buffered below and
+        // resent under the SAME commandId by the next flush: the host answers
+        // ok without typing it twice), never deleted. The cap stays the
+        // RETRY bound for every code: once reached, the 1s retry loop stops —
+        // the host write may never settle, so retries must not run unbounded
+        // — and the retained input flushes on the next re-attach, which also
+        // resets the count. Only a deterministic rejection keeps the
+        // drop-and-unblock cleanup (it will never succeed on retry).
+        const inProgress = result.code === COMMAND_RESULT_CODES.COMMAND_IN_PROGRESS
+        if (failures >= REPLAY_MAX_FAILURES && !inProgress) {
           this.inputBuffers.delete(terminalId)
           this.unconfirmedChunks.delete(terminalId)
           this.replayFailureCounts.delete(terminalId)
@@ -1045,15 +1066,45 @@ export class WebTerminalClient {
           return
         }
         this.replayFailureCounts.set(terminalId, failures)
-        this.unconfirmedChunks.set(terminalId, chunk)
-        const unsent = [chunk, ...pending].map((entry) => entry.data).join('')
-        const arrived = this.inputBuffers.get(terminalId) ?? ''
-        this.inputBuffers.set(terminalId, unsent + arrived)
-        void logFrontendError({
-          level: 'warn',
-          source: 'WebTerminalClient.flushInputBuffer',
-          message: `buffered-input replay failed (${result.code ?? 'UNKNOWN_ERROR'}) — input re-buffered for the next re-attach`
-        })
+        if (result.code === IpcErrorCodes.WRITE_FAILED) {
+          // A WRITE_FAILED is a host rejection the command ledger RECORDS and
+          // REPLAYS (`Settled::Rejected`): a resend under the SAME commandId
+          // is answered with the recorded rejection without re-running the
+          // write — it can never succeed — and a resend under a NEW id would
+          // re-run and could double-type a partially applied chunk
+          // (`PtyManager::write` is write_all + flush; a failure after the
+          // first byte does not report how many bytes landed). Drop the
+          // rejected chunk under any id; keep only the not-yet-sent chunks
+          // and the keystrokes that arrived behind the hold for the next
+          // flush (still bounded by the failure cap above).
+          this.unconfirmedChunks.delete(terminalId)
+          const unsent = pending.map((entry) => entry.data).join('')
+          const arrived = this.inputBuffers.get(terminalId) ?? ''
+          if (unsent || arrived) this.inputBuffers.set(terminalId, unsent + arrived)
+          else this.inputBuffers.delete(terminalId)
+          void logFrontendError({
+            level: 'warn',
+            source: 'WebTerminalClient.flushInputBuffer',
+            message: `buffered-input replay rejected (${result.code ?? 'UNKNOWN_ERROR'}) — rejected chunk dropped, remaining input kept for the next flush`
+          })
+        } else {
+          this.unconfirmedChunks.set(terminalId, chunk)
+          const unsent = [chunk, ...pending].map((entry) => entry.data).join('')
+          const arrived = this.inputBuffers.get(terminalId) ?? ''
+          this.inputBuffers.set(terminalId, unsent + arrived)
+          void logFrontendError({
+            level: 'warn',
+            source: 'WebTerminalClient.flushInputBuffer',
+            message: inProgress
+              ? `buffered-input replay still running on the host after ${failures} consecutive tries — input retained for the next flush`
+              : `buffered-input replay failed (${result.code ?? 'UNKNOWN_ERROR'}) — input re-buffered for the next re-attach`
+          })
+        }
+        if (failures >= REPLAY_MAX_FAILURES) {
+          // Cap reached on an in-progress reply: the payload above is
+          // retained, but the bounded retry loop stops here (see above).
+          return
+        }
         // While the socket stays attached no re-attach will flush this, and
         // new keystrokes queue behind it (see `write`). Try again soon.
         setTimeout(() => {
@@ -1090,6 +1141,7 @@ export class WebTerminalClient {
     // Story 10: an exited terminal never resumes — drop its buffer.
     this.inputBuffers.delete(terminalId)
     this.unconfirmedChunks.delete(terminalId)
+    this.replayFailureCounts.delete(terminalId)
   }
 
   onData(callback: TerminalDataCallback): () => void {
